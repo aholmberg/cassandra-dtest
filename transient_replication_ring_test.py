@@ -134,14 +134,10 @@ class TestTransientReplicationRing(Tester):
             self.keyspace, self.table))
 
     def quorum(self, session, stmt_str):
-        return session.execute(SimpleStatement(stmt_str, consistency_level=ConsistencyLevel.QUORUM))
+        return session.execute(SimpleStatement(stmt_str, consistency_level=ConsistencyLevel.QUORUM), timeout=30)
 
     def insert_row(self, pk, ck, value, session=None, node=None):
         session = session or self.exclusive_cql_connection(node or self.node1)
-        #token = BytesToken.from_key(pack('>i', pk)).value
-        #assert token < BytesToken.from_string(self.tokens[0]).value or BytesToken.from_string(self.tokens[-1]).value < token   # primary replica should be node1
-        #TODO Is quorum really right? I mean maybe we want ALL with retries since we really don't want to the data
-        #not at a replica unless it is intentional
         self.quorum(session, "INSERT INTO %s.%s (pk, ck, value) VALUES ('%05d', %s, %s)" % (self.keyspace, self.table, pk, ck, value))
 
     @flaky(max_runs=1)

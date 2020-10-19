@@ -407,7 +407,7 @@ class TestTTL(Tester):
             prefix = 'default ' if default_ttl else ''
             warning = node1.grep_log("Request on table {}.{} with {}ttl of {} seconds exceeds maximum supported expiration"
                                      .format('ks', 'ttl_table', prefix, MAX_TTL))
-            assert warning, 'Log message should be print for CAP and CAP_NOWARN policy'
+            assert warning, 'Log message should be printed for CAP and CAP_NOWARN policy'
 
 
 class TestDistributedTTL(Tester):
