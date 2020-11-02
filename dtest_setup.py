@@ -212,7 +212,8 @@ class DTestSetup(object):
                             ssl_options=ssl_opts,
                             connect_timeout=15,
                             allow_beta_protocol_version=True,
-                            execution_profiles=profiles)
+                            execution_profiles=profiles,
+                            idle_heartbeat_interval=0)
         session = cluster.connect(wait_for_all_pools=True)
 
         if keyspace is not None:
