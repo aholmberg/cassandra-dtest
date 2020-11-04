@@ -10,6 +10,7 @@ import re
 import logging
 from datetime import datetime
 import time
+import traceback
 
 from cassandra.cluster import EXEC_PROFILE_DEFAULT
 from cassandra.concurrent import execute_concurrent_with_args
@@ -32,7 +33,7 @@ from tools.misc import generate_ssl_stores
 since = pytest.mark.since
 logger = logging.getLogger(__name__)
 
-class NoException(object):
+class NoException(BaseException):
     pass
 
 jmx = None
@@ -310,6 +311,11 @@ VIEW = 'mv'
 TOMBSTONE_FAILURE_THRESHOLD = 20
 TOMBSTONE_FAIL_KEY = 10000001
 
+k = 0
+def new_key():
+    global k
+    k += 1
+    return k
 
 class TestClientRequestMetrics(Tester):
 
@@ -318,7 +324,7 @@ class TestClientRequestMetrics(Tester):
         fixture_dtest_setup.ignore_log_patterns = (
             'Testing write failures',  # The error to simulate a write failure
             'ERROR WRITE_FAILURE',  # Logged in DEBUG mode for write failures
-            f"Scanned over {TOMBSTONE_FAILURE_THRESHOLD+1} tombstones during query"  # Caused by the failure tests
+            f"Scanned over {TOMBSTONE_FAILURE_THRESHOLD+1} tombstones during query"  # Caused by the read failure tests
         )
 
     def setup_once(self):
@@ -329,14 +335,15 @@ class TestClientRequestMetrics(Tester):
                                            'tombstone_failure_threshold': TOMBSTONE_FAILURE_THRESHOLD,
                                            'enable_materialized_views': 'true'})
         cluster.populate(2, debug=True)
-        cluster.start(jvm_args=[f"-Dcassandra.test.fail_writes_ks={FAIL_WRITE_KEYSPACE}"])
+        # cluster.start(jvm_args=[f"-Dcassandra.test.fail_writes_ks={FAIL_WRITE_KEYSPACE}"])
+        self.start_cluster()
         node1 = cluster.nodelist()[0]
 
         global jmx
         jmx = JolokiaAgent(node1)
         jmx.start()
 
-        s = self.session = self.patient_exclusive_cql_connection(node1)
+        s = self.session = self.patient_exclusive_cql_connection(node1, retry_policy=NeverRetryPolicy(), request_timeout=30)
         for k in [KEYSPACE, FAIL_WRITE_KEYSPACE]:
             s.execute(f"CREATE KEYSPACE {k} WITH replication = {{'class': 'SimpleStrategy', 'replication_factor': '2'}}")
             s.execute(f"CREATE TABLE {k}.{TABLE} (k int, c int, v int, PRIMARY KEY (k,c))")
@@ -351,31 +358,41 @@ class TestClientRequestMetrics(Tester):
         node1.watch_log_for("Created default superuser role 'cassandra'")  # don't race with async default role creation, which creates a write
         node1.watch_log_for('Completed submission of build tasks for any materialized views defined at startup', filename='debug.log')  # view builds cause background reads
 
+    def start_cluster(self):
+        self.cluster.start(jvm_args=[f"-Dcassandra.test.fail_writes_ks={FAIL_WRITE_KEYSPACE}"])
+
     def test_client_request_metrics(self):
         self.setup_once()
-        # self.write_happy_path()
-        # self.read_happy_path()
-        self.write_failures()
-        # self.write_unavailables()
-        # self.write_timeouts()
-        # self.read_failures()
-        # self.read_unavailables()
-        # self.read_timeouts()
-        # self.range_slice_failures()
-        # self.range_slice_unavailables()
-        # self.range_slice_timeouts()
-        # self.view_writes()
-        # self.cas_read()
-        # self.cas_read_contention()
-        # self.cas_read_failures()
-        # self.cas_read_unavailables()
-        # self.cas_read_timeouts()
-        # self.cas_write()
-        # self.cas_read_contention()
 
-        self.cas_write_failures()
-        # self.cas_write_unavailables()
-        # self.cas_write_timeouts()
+        # DecayingEstimatedHistogramReservoir
+        self.write_happy_path()
+        self.read_happy_path()
+
+        self.write_failures()
+        self.read_failures()
+        self.write_unavailables()
+        self.write_timeouts()
+
+        self.read_failures()
+        self.read_unavailables()
+        self.read_timeouts()
+
+        self.range_slice_failures()
+        self.range_slice_unavailables()
+        self.range_slice_timeouts()
+
+        self.view_writes()
+
+        self.cas_read()
+        self.cas_read_contention()
+        self.cas_read_failures()
+        self.cas_read_unavailables()
+        self.cas_read_timeouts()
+
+        self.cas_write()
+        self.cas_write_contention()
+        self.cas_write_unavailables()
+        self.cas_write_timeouts()
         self.cas_write_condition_not_met()
 
     def view_writes(self):
@@ -427,9 +444,7 @@ class TestClientRequestMetrics(Tester):
         # to watch for them to settle.
         sample = ViewWriteMetrics(scope)
         diff = sample.diff(baseline)
-        i = 0
         while diff and 'Latency.Count' in diff:
-            print(f"#### {++i}")
             time.sleep(0.5)
             last = sample
             sample = ViewWriteMetrics(scope)
@@ -454,8 +469,8 @@ class TestClientRequestMetrics(Tester):
 
     def cas_write_contention(self):
         self.cas_contention(partial(CASClientWriteRequestMetrics, 'CASWrite'),
-                            SimpleStatement(f"INSERT INTO {KEYSPACE}.{TABLE} (k,c) VALUES (0,0) IF NOT EXISTS",
-                                            consistency_level=CL.ONE))
+                            SimpleStatement(f"INSERT INTO {KEYSPACE}.{TABLE} (k,c) VALUES ({new_key()},0) IF NOT EXISTS",
+                                            consistency_level=CL.TWO))
 
     def cas_read_contention(self):
         self.cas_contention(partial(CASClientRequestMetrics, 'CASRead'),
@@ -464,26 +479,34 @@ class TestClientRequestMetrics(Tester):
 
     def cas_contention(self, metric_factory, statement):
 
-        baseline = metric_factory()
-        baseline.validate()
+        query_count = 20
 
-        query_count = 10
-        execute_concurrent_with_args(self.session,
-                                     statement,
-                                     repeat([], query_count))
+        def sample():
+            baseline = metric_factory()
+            baseline.validate()
 
-        updated = metric_factory()
-        updated.validate()
+            execute_concurrent_with_args(self.session,
+                                         statement,
+                                         repeat([], query_count), raise_on_first_error=False)
 
-        diff = updated.diff(baseline)
+            updated = metric_factory()
+            updated.validate()
+
+            return updated.diff(baseline)
+
+        for _ in range(10):
+            diff = sample()
+            if 'ContentionHistogram.Count' in diff:
+                break
+
         assert diff['Latency.Count'] == query_count
         assert diff['TotalLatency.Count'] > 0
-        assert 0 < diff['ContentionHistogram.Count'] <= query_count - 1
+        assert 0 < diff['ContentionHistogram.Count'] <= query_count
 
     def cas_write_condition_not_met(self):
         scope = 'CASWrite'
         baseline = CASClientWriteRequestMetrics(scope)
-        key = 1001
+        key = new_key()
         query_count = 5
         for _ in range(query_count):
             self.session.execute(f"UPDATE {KEYSPACE}.{TABLE} SET v=0 WHERE k={key} AND c=0 IF v!=0")
@@ -548,7 +571,8 @@ class TestClientRequestMetrics(Tester):
         return global_diff, cl_diff
 
     def cas_write_unavailables(self):
-        ks = VIEW_KEYSPACE  # because RF=2
+        # ks = VIEW_KEYSPACE  # because RF=2
+        ks = KEYSPACE
         self.cas_unavailables_variant('CASWrite',
                                       CASClientWriteRequestMetrics,
                                       SimpleStatement(f"UPDATE {ks}.{TABLE} SET v=2 WHERE k=0 AND c=0 IF v!=0",
@@ -577,7 +601,7 @@ class TestClientRequestMetrics(Tester):
 
     def cas_write_failures(self):
         query_count = 2
-        diff = self.write_failures_variant('CASWrite', 'WHERE k=0 AND c=0 IF v!=0',
+        diff = self.write_failures_variant('CASWrite', f"WHERE k={new_key()} AND c=0 IF v!=0",
                                     query_count=query_count, metric_class=CASClientWriteRequestMetrics)
         # The way we're failing writes causes a StorageProxy::cas to throw before the metric is
         # incremented on each request after the first one.  We find the previous ballot in-progress and fail trying to
@@ -632,7 +656,8 @@ class TestClientRequestMetrics(Tester):
         self.read_unavailables_variant('RangeSlice', '')
 
     def cas_read_unavailables(self):
-        ks = VIEW_KEYSPACE  # because RF=2
+        # ks = VIEW_KEYSPACE  # because RF=2
+        ks = KEYSPACE
         self.cas_unavailables_variant('CASRead',
                                       CASClientRequestMetrics,
                                       SimpleStatement(f"SELECT k FROM {ks}.{TABLE} WHERE k=0 AND c=0",
@@ -651,7 +676,8 @@ class TestClientRequestMetrics(Tester):
                              'Unavailables',
                              Unavailable
                                     )
-        node2.start()
+        # node2.start()
+        self.start_cluster()
         #todo: for all CAS, do we need to do more validation here?
 
     def read_unavailables_variant(self, scope, constraint, validator=None, metric_class=RequestMetrics):
@@ -668,7 +694,7 @@ class TestClientRequestMetrics(Tester):
                   )
 
     def read_failures(self):
-        self.read_failures_variant('Read', f"WHERE k={TOMBSTONE_FAIL_KEY}", self.validate_exception_metric_with_cl)
+        self.read_failures_variant('Read', f"WHERE k={TOMBSTONE_FAIL_KEY}", self.validate_exception_metric_with_cl, query_cl=CL.TWO)
 
     def range_slice_failures(self):
         self.read_failures_variant('RangeSlice')
@@ -730,10 +756,9 @@ class TestClientRequestMetrics(Tester):
     def validate_metric(self, scope, metric_class, statement, query_count, secondary_meter=None, expected_exception=NoException):
         baseline = metric_class(scope)
 
-        exe_profile = self.session.execution_profile_clone_update(EXEC_PROFILE_DEFAULT, retry_policy=NeverRetryPolicy())
         for _ in range(query_count):
             try:
-                self.session.execute(statement, execution_profile=exe_profile, timeout=2000000)
+                self.session.execute(statement)
                 # self.session.execute(statement, execution_profile=exe_profile, timeout=20)
                 if expected_exception != NoException:
                     assert False, f"Request did not raise expected exception: {expected_exception}"
