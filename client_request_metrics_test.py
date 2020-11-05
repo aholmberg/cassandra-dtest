@@ -281,7 +281,7 @@ class TestClientRequestMetrics(Tester):
         def ip_of_key(ks, key):
             hosts = self.session.cluster.metadata.get_replicas(ks, int32_pack(key))
             host = hosts[0]
-            return host.broadcast_rpc_address
+            return host.address
 
         def key_for(ks, ip):
             return next(x for x in range(100000) if ip_of_key(ks, x) == ip)
