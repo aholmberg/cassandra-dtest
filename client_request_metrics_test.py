@@ -16,6 +16,8 @@ from cassandra.marshal import int32_pack
 from cassandra.policies import FallthroughRetryPolicy
 from cassandra.query import SimpleStatement
 
+since = pytest.mark.since
+
 jmx = None
 
 KEYSPACE = 'ks'
@@ -31,6 +33,7 @@ class NoException(BaseException):
     pass
 
 
+@since('4.0')
 class TestClientRequestMetrics(Tester):
 
     @pytest.fixture(autouse=True)
