@@ -13,7 +13,7 @@ from cassandra import (ReadFailure, ReadTimeout, Unavailable,
                        ConsistencyLevel as CL)
 from cassandra.concurrent import execute_concurrent_with_args
 from cassandra.marshal import int32_pack
-from cassandra.policies import NeverRetryPolicy
+from cassandra.policies import FallthroughRetryPolicy
 from cassandra.query import SimpleStatement
 
 jmx = None
@@ -49,7 +49,6 @@ class TestClientRequestMetrics(Tester):
                                            'tombstone_failure_threshold': TOMBSTONE_FAILURE_THRESHOLD,
                                            'enable_materialized_views': 'true'})
         cluster.populate(2, debug=True)
-        # cluster.start(jvm_args=[f"-Dcassandra.test.fail_writes_ks={FAIL_WRITE_KEYSPACE}"])
         self.start_cluster()
         node1 = cluster.nodelist()[0]
 
@@ -57,7 +56,7 @@ class TestClientRequestMetrics(Tester):
         jmx = JolokiaAgent(node1)
         jmx.start()
 
-        s = self.session = self.patient_exclusive_cql_connection(node1, retry_policy=NeverRetryPolicy(), request_timeout=30)
+        s = self.session = self.patient_exclusive_cql_connection(node1, retry_policy=FallthroughRetryPolicy(), request_timeout=30)
         for k in [KEYSPACE, FAIL_WRITE_KEYSPACE]:
             s.execute(f"CREATE KEYSPACE {k} WITH replication = {{'class': 'SimpleStrategy', 'replication_factor': '2'}}")
             s.execute(f"CREATE TABLE {k}.{TABLE} (k int, c int, v int, PRIMARY KEY (k,c))")
