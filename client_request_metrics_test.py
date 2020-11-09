@@ -5,7 +5,7 @@ from itertools import repeat
 import pytest
 import time
 
-from dtest import Tester
+from dtest import Tester, create_ks
 from tools.jmxutils import (JolokiaAgent, make_mbean)
 
 from cassandra import (ReadFailure, ReadTimeout, Unavailable,
@@ -27,7 +27,7 @@ TABLE = 't'
 VIEW = 'mv'
 TOMBSTONE_FAILURE_THRESHOLD = 20
 TOMBSTONE_FAIL_KEY = 10000001
-
+JVM_ARGS=[f"-Dcassandra.test.fail_writes_ks={FAIL_WRITE_KEYSPACE}"]
 
 class NoException(BaseException):
     pass
@@ -41,7 +41,7 @@ class TestClientRequestMetrics(Tester):
         fixture_dtest_setup.ignore_log_patterns = (
             'Testing write failures',  # The error to simulate a write failure
             'ERROR WRITE_FAILURE',  # Logged in DEBUG mode for write failures
-            f"Scanned over {TOMBSTONE_FAILURE_THRESHOLD+1} tombstones during query"  # Caused by the read failure tests
+            f"Scanned over {TOMBSTONE_FAILURE_THRESHOLD + 1} tombstones during query"  # Caused by the read failure tests
         )
 
     def setup_once(self):
@@ -52,7 +52,7 @@ class TestClientRequestMetrics(Tester):
                                            'tombstone_failure_threshold': TOMBSTONE_FAILURE_THRESHOLD,
                                            'enable_materialized_views': 'true'})
         cluster.populate(2, debug=True)
-        self.start_cluster()
+        cluster.start(jvm_args=JVM_ARGS)
         node1 = cluster.nodelist()[0]
 
         global jmx
@@ -61,26 +61,26 @@ class TestClientRequestMetrics(Tester):
 
         s = self.session = self.patient_exclusive_cql_connection(node1, retry_policy=FallthroughRetryPolicy(), request_timeout=30)
         for k in [KEYSPACE, FAIL_WRITE_KEYSPACE]:
-            s.execute(f"CREATE KEYSPACE {k} WITH replication = {{'class': 'SimpleStrategy', 'replication_factor': '2'}}")
+            create_ks(s, k, 2)
             s.execute(f"CREATE TABLE {k}.{TABLE} (k int, c int, v int, PRIMARY KEY (k,c))")
 
-        s.execute(f"CREATE KEYSPACE {VIEW_KEYSPACE} WITH replication = {{'class': 'SimpleStrategy', 'replication_factor': '1'}}")
+        create_ks(s, VIEW_KEYSPACE, 1)
         s.execute(f"CREATE TABLE {VIEW_KEYSPACE}.{TABLE} (k int, c int, v int, PRIMARY KEY (k,c))")
         s.execute(f"CREATE MATERIALIZED VIEW {VIEW_KEYSPACE}.{VIEW} AS SELECT * FROM {TABLE} WHERE c IS NOT NULL AND k IS NOT NULL PRIMARY KEY (c,k);")
 
+        # Here we're doing a series of deletions in order to create enough tombstones to exceed the configured fail threshold.
+        # This partition will be used to test read failures.
         for c in range(TOMBSTONE_FAILURE_THRESHOLD + 1):
             self.session.execute(f"DELETE FROM {KEYSPACE}.{TABLE} WHERE k={TOMBSTONE_FAIL_KEY} AND c={c}")
 
         node1.watch_log_for("Created default superuser role 'cassandra'")  # don't race with async default role creation, which creates a write
         node1.watch_log_for('Completed submission of build tasks for any materialized views defined at startup', filename='debug.log')  # view builds cause background reads
 
-    def start_cluster(self):
-        self.cluster.start(jvm_args=[f"-Dcassandra.test.fail_writes_ks={FAIL_WRITE_KEYSPACE}"])
-
     def test_client_request_metrics(self):
+        # this is written as a single test method in order to reuse the same cluster for all tests
+        # setup_once configures and starts the cluster with all schema and preconditions required by all tests.
         self.setup_once()
 
-        # DecayingEstimatedHistogramReservoir
         self.write_nominal()
         self.read_nominal()
 
@@ -114,7 +114,9 @@ class TestClientRequestMetrics(Tester):
         query_count = 5
         global_diff, cl_diff = self.validate_nominal('Write',
                                                      WriteMetrics,
-                                                     SimpleStatement(f"INSERT INTO {KEYSPACE}.{TABLE} (k,c) VALUES (0,0)", consistency_level=CL.ONE),
+                                                     SimpleStatement(
+                                                         f"INSERT INTO {KEYSPACE}.{TABLE} (k,c) VALUES (0,0)",
+                                                         consistency_level=CL.ONE),
                                                      query_count)
 
         assert global_diff['MutationSizeHistogram.Count'] == query_count
@@ -123,7 +125,8 @@ class TestClientRequestMetrics(Tester):
         query_count = 5
         self.validate_nominal('Read',
                               ClientRequestMetrics,
-                              SimpleStatement(f"SELECT k FROM {KEYSPACE}.{TABLE} WHERE k=0 AND c=0", consistency_level=CL.LOCAL_ONE),
+                              SimpleStatement(f"SELECT k FROM {KEYSPACE}.{TABLE} WHERE k=0 AND c=0",
+                                              consistency_level=CL.LOCAL_ONE),
                               query_count)
 
     def validate_nominal(self, global_scope, metric_class, statement, query_count):
@@ -136,7 +139,6 @@ class TestClientRequestMetrics(Tester):
         global_baseline = metric_class(global_scope)
         cl_baseline = metric_class(cl_scope)
         other_baselines = [metric_class(scope_for_cl(global_scope, c)) for c in other_cls]
-
 
         global_baseline.validate()
         cl_baseline.validate()
@@ -172,7 +174,6 @@ class TestClientRequestMetrics(Tester):
         assert diff['MutationSizeHistogram.Count'] == query_count
 
     def write_failures_variant(self, scope, constraint, query_count, validator, metric_class):
-        validator = self.validate_metric if validator is None else validator
         query_cl = CL.ONE
         diff = validator(scope,
                          metric_class,
@@ -186,6 +187,7 @@ class TestClientRequestMetrics(Tester):
         return diff
 
     def write_unavailables(self):
+        # THREE will be unavailable since RF=2
         query_cl = CL.THREE
         query_count = 5
         diff = self.validate_exception_metric_with_cl('Write',
@@ -293,16 +295,16 @@ class TestClientRequestMetrics(Tester):
         ks = VIEW_KEYSPACE
         query_count = 5
         key = key_for(ks, '127.0.0.1')
-        diff = self.run_collect_view_write_metrics(
-            SimpleStatement(f"INSERT INTO {ks}.{TABLE} (k,c) VALUES ({key},{key})", consistency_level=CL.ONE), query_count)
+        diff = self.run_collect_view_write_metrics(SimpleStatement(f"INSERT INTO {ks}.{TABLE} (k,c) VALUES ({key},{key})", consistency_level=CL.ONE),
+                                                   query_count)
         assert diff['Latency.Count'] == query_count
         assert diff['TotalLatency.Count'] > 0
 
         # base partition this node, mv partition remote
         key = key_for(ks, '127.0.0.1')
         key2 = key_for(ks, '127.0.0.2')
-        diff = self.run_collect_view_write_metrics(
-            SimpleStatement(f"INSERT INTO {ks}.{TABLE} (k,c) VALUES ({key},{key2})", consistency_level=CL.ONE), query_count)
+        diff = self.run_collect_view_write_metrics(SimpleStatement(f"INSERT INTO {ks}.{TABLE} (k,c) VALUES ({key},{key2})", consistency_level=CL.ONE),
+                                                   query_count)
         assert diff['Latency.Count'] == query_count
         assert diff['TotalLatency.Count'] > 0
         assert diff['ViewReplicasAttempted.Count'] == query_count
@@ -312,8 +314,8 @@ class TestClientRequestMetrics(Tester):
         # base partition and mv both remote
         key = key_for(ks, '127.0.0.2')
         key2 = key_for(ks, '127.0.0.2')
-        diff = self.run_collect_view_write_metrics(
-            SimpleStatement(f"INSERT INTO {ks}.{TABLE} (k,c) VALUES ({key},{key2})", consistency_level=CL.ONE), query_count)
+        diff = self.run_collect_view_write_metrics(SimpleStatement(f"INSERT INTO {ks}.{TABLE} (k,c) VALUES ({key},{key2})", consistency_level=CL.ONE),
+                                                   query_count)
         assert 'Latency.Count' not in diff
 
     def run_collect_view_write_metrics(self, statement, query_count):
@@ -340,7 +342,8 @@ class TestClientRequestMetrics(Tester):
     def cas_read(self):
         self.validate_metric('CASRead',
                              CASClientRequestMetrics,
-                             SimpleStatement(f"SELECT k FROM {KEYSPACE}.{TABLE} WHERE k=0", consistency_level=CL.SERIAL),
+                             SimpleStatement(f"SELECT k FROM {KEYSPACE}.{TABLE} WHERE k=0",
+                                             consistency_level=CL.SERIAL),
                              2)
 
     def cas_read_contention(self):
@@ -410,7 +413,7 @@ class TestClientRequestMetrics(Tester):
                              'Unavailables',
                              Unavailable
                              )
-        self.start_cluster()
+        node2.start(jvm_args=JVM_ARGS)
 
     def cas_read_timeouts(self):
         self.read_timeouts_variant('CASRead', 'WHERE k=0',
@@ -420,26 +423,25 @@ class TestClientRequestMetrics(Tester):
 
     def cas_write(self):
         self.validate_metric('CASWrite',
-                            CASClientWriteRequestMetrics,
-                            SimpleStatement(f"INSERT INTO {KEYSPACE}.{TABLE} (k,c) VALUES (0,0) IF NOT EXISTS",
-                                            consistency_level=CL.ONE),
-                            2)
+                             CASClientWriteRequestMetrics,
+                             SimpleStatement(f"INSERT INTO {KEYSPACE}.{TABLE} (k,c) VALUES (0,0) IF NOT EXISTS",
+                                             consistency_level=CL.ONE),
+                             2)
 
     def cas_write_contention(self):
         self.cas_contention(partial(CASClientWriteRequestMetrics, 'CASWrite'),
-                            SimpleStatement(f"INSERT INTO {KEYSPACE}.{TABLE} (k,c) VALUES ({new_key()},0) IF NOT EXISTS",
-                                            consistency_level=CL.TWO))
-
+                            SimpleStatement(
+                                f"INSERT INTO {KEYSPACE}.{TABLE} (k,c) VALUES ({new_key()},0) IF NOT EXISTS",
+                                consistency_level=CL.TWO))
 
     def cas_write_failures(self):
         query_count = 2
         diff = self.write_failures_variant('CASWrite', f"WHERE k={new_key()} AND c=0 IF v!=0",
-                                    query_count,
+                                           query_count,
                                            self.validate_metric,
                                            CASClientWriteRequestMetrics)
-        # The way we're failing writes causes a StorageProxy::cas to throw before the metric is
-        # incremented on each request after the first one.  We find the previous ballot in-progress and fail trying to
-        # commit it.
+        # The way we're failing writes causes a StorageProxy::cas to throw before the metric is incremented on each
+        # request after the first one.  We find the previous ballot in-progress and fail trying to commit it.
         assert diff['MutationSizeHistogram.Count'] == 1
         assert diff['UnfinishedCommit.Count'] == query_count - 1
 
@@ -491,7 +493,6 @@ class TestClientRequestMetrics(Tester):
         for _ in range(query_count):
             try:
                 self.session.execute(statement)
-                # self.session.execute(statement, execution_profile=exe_profile, timeout=20)
                 if expected_exception != NoException:
                     assert False, f"Request did not raise expected exception: {expected_exception}"
             except expected_exception:
@@ -505,6 +506,7 @@ class TestClientRequestMetrics(Tester):
             assert diff[f"{secondary_meter}.MeanRate"] > 0
 
         return diff
+
 
 ##############
 # Utilities
@@ -562,7 +564,7 @@ class Meter(AbstractPropertyValues):
 
     def validate(self):
         assert self.values['RateUnit'] == 'events/second'
-        for k,v in self.values.items():
+        for k, v in self.values.items():
             if k == 'RateUnit':
                 continue
             is_non_negative(k, v)
@@ -770,15 +772,15 @@ def is_nonzero_list(k, l):
 
 def is_histo_list(k, l):
     # since these values change on sampling, we can only generally verify it takes the proper form
-    # there is a dedicated test to make sure the histogram behaves as expected.
+    # There are in-tree unit tests around ClearableHistogram and DecayingEstimatedHistogramReservoir
     assert len(l) == 165, k
     assert all(isinstance(i, int) for i in l), k
 
 
-k = 0
+last_key = 0
+
+
 def new_key():
-    global k
-    k += 1
-    return k
-
-
+    global last_key
+    last_key += 1
+    return last_key
